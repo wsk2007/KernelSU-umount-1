@@ -2,6 +2,8 @@ use anyhow::{Ok, Result};
 use getopts::Options;
 use std::env;
 #[cfg(unix)]
+use anyhow::ensure;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::{ffi::CStr, process::Command};
