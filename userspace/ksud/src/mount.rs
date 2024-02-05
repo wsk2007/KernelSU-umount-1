@@ -1,4 +1,5 @@
 use anyhow::{bail, Ok, Result};
+use retry::delay::NoDelay;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use anyhow::Context;
@@ -137,18 +138,15 @@ pub fn mount_overlayfs(
     workdir: Option<PathBuf>,
     dest: impl AsRef<Path>,
 ) -> Result<()> {
-    let lowerdir_config = lower_dirs
-        .iter()
-        .map(|s| s.as_ref())
-        .chain(std::iter::once(lowest))
-        .collect::<Vec<_>>()
-        .join(":");
+let options = format!(
+        "lowerdir={}:{}",
+        lower_dirs.join(":"),
+        lowest.as_ref().display()
+    );
     info!(
-        "mount overlayfs on {:?}, lowerdir={}, upperdir={:?}, workdir={:?}",
-        dest.as_ref(),
-        lowerdir_config,
-        upperdir,
-        workdir
+        "mount overlayfs on {}, options={}",
+        dest.as_ref().display(),
+        options
     );
     Mount::builder()
         .fstype(FilesystemType::from("overlay"))

@@ -1,6 +1,7 @@
 use anyhow::{Ok, Result};
 use getopts::Options;
 use std::env;
+use retry::delay::NoDelay;
 #[cfg(unix)]
 use anyhow::ensure;
 #[cfg(unix)]
