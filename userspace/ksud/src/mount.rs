@@ -130,13 +130,6 @@ pub fn umount_dir(src: &str) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn umount_dir(src: impl AsRef<Path>) -> Result<()> {
-    unmount(src.as_ref(), UnmountFlags::empty())
-        .with_context(|| format!("Failed to umount {}", src.as_ref().display()))?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn mount_overlayfs(
     lower_dirs: &[String],
     lowest: &str,
