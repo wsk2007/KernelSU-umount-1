@@ -1,10 +1,10 @@
-use anyhow::{anyhow, bail, Ok, Result};
+use anyhow::{bail, Ok, Result};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use anyhow::Context;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use rustix::{fd::AsFd, fs::CWD, mount::*};
+use sys_mount::{unmount, FilesystemType, Mount, MountFlags, Unmount, UnmountFlags};
 
 use crate::defs::KSU_OVERLAY_SOURCE;
 use log::{info, warn};
@@ -14,18 +14,49 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub struct AutoMountExt4 {
-    target: String,
+    mnt: String,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mount: Option<Mount>,
     auto_umount: bool,
 }
 
 impl AutoMountExt4 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn try_new(source: &str, target: &str, auto_umount: bool) -> Result<Self> {
-        mount_ext4(source, target)?;
-        Ok(Self {
-            target: target.to_string(),
-            auto_umount,
-        })
+    pub fn try_new(src: &str, mnt: &str, auto_umount: bool) -> Result<Self> {
+        let result = Mount::builder()
+            .fstype(FilesystemType::from("ext4"))
+            .flags(MountFlags::empty())
+            .create_loop(true)
+            .mount(src, mnt)
+            .map(|mount| {
+                Ok(Self {
+                    mnt: mnt.to_string(),
+                    mount: Some(mount),
+                    auto_umount,
+                })
+            });
+        if let Err(e) = result {
+            println!("- Mount failed: {e}, retry with system mount");
+            let result = std::process::Command::new("mount")
+                .arg("-t")
+                .arg("ext4")
+                .arg(src)
+                .arg(mnt)
+                .status();
+            if let Err(e) = result {
+                Err(anyhow::anyhow!(
+                    "mount partition: {src} -> {mnt} failed: {e}"
+                ))
+            } else {
+                Ok(Self {
+                    mnt: mnt.to_string(),
+                    mount: None,
+                    auto_umount,
+                })
+            }
+        } else {
+            result.unwrap()
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -35,8 +66,18 @@ impl AutoMountExt4 {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn umount(&self) -> Result<()> {
-        unmount(self.target.as_str(), UnmountFlags::DETACH)?;
-        Ok(())
+        if let Some(ref mount) = self.mount {
+            mount
+                .unmount(UnmountFlags::empty())
+                .map_err(|e| anyhow::anyhow!(e))
+        } else {
+            let result = std::process::Command::new("umount").arg(&self.mnt).status();
+            if let Err(e) = result {
+                Err(anyhow::anyhow!("umount: {} failed: {e}", self.mnt))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -45,7 +86,7 @@ impl Drop for AutoMountExt4 {
     fn drop(&mut self) {
         log::info!(
             "AutoMountExt4 drop: {}, auto_umount: {}",
-            self.target,
+            self.mnt,
             self.auto_umount
         );
         if self.auto_umount {
@@ -55,22 +96,36 @@ impl Drop for AutoMountExt4 {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn mount_ext4(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    let new_loopback = loopdev::LoopControl::open()?.next_free()?;
-    new_loopback.with().attach(source)?;
-    let lo = new_loopback.path().ok_or(anyhow!("no loop"))?;
-    let fs = fsopen("ext4", FsOpenFlags::FSOPEN_CLOEXEC)?;
-    let fs = fs.as_fd();
-    fsconfig_set_string(fs, "source", lo)?;
-    fsconfig_create(fs)?;
-    let mount = fsmount(fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
-    move_mount(
-        mount.as_fd(),
-        "",
-        CWD,
-        target.as_ref(),
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )?;
+fn mount_image(src: &str, target: &str, autodrop: bool) -> Result<()> {
+    if autodrop {
+        Mount::builder()
+            .fstype(FilesystemType::from("ext4"))
+            .create_loop(true)
+            .mount_autodrop(src, target, UnmountFlags::empty())
+            .with_context(|| format!("Failed to do mount: {src} -> {target}"))?;
+    } else {
+        Mount::builder()
+            .fstype(FilesystemType::from("ext4"))
+            .mount(src, target)
+            .with_context(|| format!("Failed to do mount: {src} -> {target}"))?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn mount_ext4(src: &str, target: &str, autodrop: bool) -> Result<()> {
+    // umount target first.
+    let _ = umount_dir(target);
+    let result = retry::retry(NoDelay.take(3), || mount_image(src, target, autodrop));
+    result
+        .map_err(|e| anyhow::anyhow!("mount partition: {src} -> {target} failed: {e}"))
+        .map(|_| ())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn umount_dir(src: &str) -> Result<()> {
+    unmount(src, UnmountFlags::empty()).with_context(|| format!("Failed to umount {src}"))?;
     Ok(())
 }
 
@@ -102,43 +157,28 @@ pub fn mount_overlayfs(
         upperdir,
         workdir
     );
-    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
-    let fs = fs.as_fd();
-    fsconfig_set_string(fs, "lowerdir", lowerdir_config)?;
-    if let (Some(upperdir), Some(workdir)) = (upperdir, workdir) {
-        if upperdir.exists() && workdir.exists() {
-            fsconfig_set_string(fs, "upperdir", upperdir.display().to_string())?;
-            fsconfig_set_string(fs, "workdir", workdir.display().to_string())?;
-        }
-    }
-    fsconfig_set_string(fs, "source", KSU_OVERLAY_SOURCE)?;
-    fsconfig_create(fs)?;
-    let mount = fsmount(fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
-    move_mount(
-        mount.as_fd(),
-        "",
-        CWD,
-        dest.as_ref(),
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )?;
+    Mount::builder()
+        .fstype(FilesystemType::from("overlay"))
+        .data(&options)
+        .flags(MountFlags::RDONLY)
+        .mount(KSU_OVERLAY_SOURCE, dest.as_ref())
+        .with_context(|| {
+            format!(
+                "mount overlayfs on {} options {} failed",
+                dest.as_ref().display(),
+                options
+            )
+        })?;
     Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn mount_tmpfs(dest: impl AsRef<Path>) -> Result<()> {
     info!("mount tmpfs on {}", dest.as_ref().display());
-    let fs = fsopen("tmpfs", FsOpenFlags::FSOPEN_CLOEXEC)?;
-    let fs = fs.as_fd();
-    fsconfig_set_string(fs, "source", KSU_OVERLAY_SOURCE)?;
-    fsconfig_create(fs)?;
-    let mount = fsmount(fs, FsMountFlags::FSMOUNT_CLOEXEC, MountAttrFlags::empty())?;
-    move_mount(
-        mount.as_fd(),
-        "",
-        CWD,
-        dest.as_ref(),
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )?;
+    Mount::builder()
+        .fstype(FilesystemType::from("tmpfs"))
+        .mount(KSU_OVERLAY_SOURCE, dest.as_ref())
+        .with_context(|| format!("mount tmpfs on {} failed", dest.as_ref().display()))?;
     Ok(())
 }
 
@@ -149,20 +189,16 @@ fn bind_mount(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
         from.as_ref().display(),
         to.as_ref().display()
     );
-    let tree = open_tree(
-        CWD,
-        from.as_ref(),
-        OpenTreeFlags::OPEN_TREE_CLOEXEC
-            | OpenTreeFlags::OPEN_TREE_CLONE
-            | OpenTreeFlags::AT_RECURSIVE,
-    )?;
-    move_mount(
-        tree.as_fd(),
-        "",
-        CWD,
-        to.as_ref(),
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )?;
+    Mount::builder()
+        .flags(MountFlags::BIND)
+        .mount(from.as_ref(), to.as_ref())
+        .with_context(|| {
+            format!(
+                "bind mount failed: {} -> {}",
+                from.as_ref().display(),
+                to.as_ref().display()
+            )
+        })?;
     Ok(())
 }
 
