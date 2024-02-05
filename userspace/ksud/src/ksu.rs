@@ -1,7 +1,4 @@
 use anyhow::{Ok, Result};
-
-#[cfg(unix)]
-use anyhow::ensure;
 use getopts::Options;
 use std::env;
 #[cfg(unix)]
@@ -67,15 +64,13 @@ fn print_usage(program: &str, opts: Options) {
 
 fn set_identity(uid: u32, gid: u32, groups: &[u32]) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        if !groups.is_empty() {
+            libc::setgroups(groups.len(), groups.as_ptr());
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        rustix::process::set_groups(
-            groups
-                .iter()
-                .map(|g| unsafe { Gid::from_raw(*g) })
-                .collect::<Vec<_>>()
-                .as_ref(),
-        )
-        .ok();
         let gid = unsafe { Gid::from_raw(gid) };
         let uid = unsafe { Uid::from_raw(uid) };
         set_thread_res_gid(gid, gid, gid).ok();
