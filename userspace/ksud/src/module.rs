@@ -11,6 +11,7 @@ use const_format::concatcp;
 use is_executable::is_executable;
 use java_properties::PropertiesIter;
 use log::{info, warn};
+
 use std::{
     collections::HashMap,
     env::var as env_var,
@@ -444,6 +445,10 @@ fn _install_module(zip: &str) -> Result<()> {
 
     exec_install_script(zip)?;
 
+    if let Err(e) = utils::punch_hole(tmp_module_img) {
+        warn!("Failed to punch hole: {}", e);
+    }
+
     info!("rename {tmp_module_img} to {}", defs::MODULE_UPDATE_IMG);
     // all done, rename the tmp image to modules_update.img
     if std::fs::rename(tmp_module_img, defs::MODULE_UPDATE_IMG).is_err() {
@@ -471,7 +476,7 @@ pub fn install_module(zip: &str) -> Result<()> {
     result
 }
 
-fn update_module<F>(update_dir: &str, id: &str, func: F) -> Result<()>
+fn update_module<F>(update_dir: &str, id: &str, punch_hole: bool, func: F) -> Result<()>
 where
     F: Fn(&str, &str) -> Result<()>,
 {
@@ -507,6 +512,12 @@ where
     // call the operation func
     let result = func(id, update_dir);
 
+    if punch_hole {
+        if let Err(e) = utils::punch_hole(modules_update_tmp_img) {
+            warn!("Failed to punch hole: {}", e);
+        }
+    }
+
     if let Err(e) = std::fs::rename(modules_update_tmp_img, defs::MODULE_UPDATE_IMG) {
         warn!("Rename image failed: {e}, try copy it.");
         utils::copy_sparse_file(modules_update_tmp_img, defs::MODULE_UPDATE_IMG)
@@ -520,7 +531,7 @@ where
 }
 
 pub fn uninstall_module(id: &str) -> Result<()> {
-    update_module(defs::MODULE_UPDATE_TMP_DIR, id, |mid, update_dir| {
+    update_module(defs::MODULE_UPDATE_TMP_DIR, id, true, |mid, update_dir| {
         let dir = Path::new(update_dir);
         ensure!(dir.exists(), "No module installed");
 
@@ -586,13 +597,13 @@ fn _enable_module(module_dir: &str, mid: &str, enable: bool) -> Result<()> {
 }
 
 pub fn enable_module(id: &str) -> Result<()> {
-    update_module(defs::MODULE_UPDATE_TMP_DIR, id, |mid, update_dir| {
+    update_module(defs::MODULE_UPDATE_TMP_DIR, id, false, |mid, update_dir| {
         _enable_module(update_dir, mid, true)
     })
 }
 
 pub fn disable_module(id: &str) -> Result<()> {
-    update_module(defs::MODULE_UPDATE_TMP_DIR, id, |mid, update_dir| {
+    update_module(defs::MODULE_UPDATE_TMP_DIR, id, false, |mid, update_dir| {
         _enable_module(update_dir, mid, false)
     })
 }
@@ -653,10 +664,12 @@ fn _list_modules(path: &str) -> Vec<HashMap<String, String>> {
         let enabled = !path.join(defs::DISABLE_FILE_NAME).exists();
         let update = path.join(defs::UPDATE_FILE_NAME).exists();
         let remove = path.join(defs::REMOVE_FILE_NAME).exists();
+        let web = path.join(defs::MODULE_WEB_DIR).exists();
 
         module_prop_map.insert("enabled".to_owned(), enabled.to_string());
         module_prop_map.insert("update".to_owned(), update.to_string());
         module_prop_map.insert("remove".to_owned(), remove.to_string());
+        module_prop_map.insert("web".to_owned(), web.to_string());
 
         if result.is_err() {
             warn!("Failed to parse module.prop: {}", module_prop.display());
@@ -674,11 +687,20 @@ pub fn list_modules() -> Result<()> {
     Ok(())
 }
 
-pub fn shrink_image() -> Result<()> {
+pub fn shrink_image(img: &str) -> Result<()> {
+    check_image(img)?;
     Command::new("resize2fs")
         .arg("-M")
-        .arg(defs::MODULE_IMG)
+        .arg(img)
         .stdout(Stdio::piped())
         .status()?;
+    Ok(())
+}
+
+pub fn shrink_ksu_images() -> Result<()> {
+    shrink_image(defs::MODULE_IMG)?;
+    if Path::new(defs::MODULE_UPDATE_IMG).exists() {
+        shrink_image(defs::MODULE_UPDATE_IMG)?;
+    }
     Ok(())
 }

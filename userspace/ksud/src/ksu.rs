@@ -38,7 +38,10 @@ const EVENT_BOOT_COMPLETED: u64 = 2;
 const EVENT_MODULE_MOUNTED: u64 = 3;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn grant_root() -> Result<()> {
+pub fn grant_root(global_mnt: bool) -> Result<()> {
+    const KERNEL_SU_OPTION: u32 = 0xDEAD_BEEF;
+    const CMD_GRANT_ROOT: u64 = 0;
+
     let mut result: u32 = 0;
     unsafe {
         #[allow(clippy::cast_possible_wrap)]
@@ -51,12 +54,22 @@ pub fn grant_root() -> Result<()> {
         );
     }
 
-    ensure!(result == KERNEL_SU_OPTION, "grant root failed");
-    Err(std::process::Command::new("sh").exec().into())
+    anyhow::ensure!(result == KERNEL_SU_OPTION, "grant root failed");
+    let mut command = std::process::Command::new("sh");
+    let command = unsafe {
+        command.pre_exec(move || {
+            if global_mnt {
+                let _ = utils::switch_mnt_ns(1);
+                let _ = utils::unshare_mnt_ns();
+            }
+            std::result::Result::Ok(())
+        })
+    };
+    Err(command.exec().into())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn grant_root() -> Result<()> {
+pub fn grant_root(_global_mnt: bool) -> Result<()> {
     unimplemented!("grant_root is only available on android");
 }
 
