@@ -1,6 +1,9 @@
 use anyhow::{Ok, Result};
 use getopts::Options;
 use std::env;
+use retry::delay::NoDelay;
+#[cfg(unix)]
+use anyhow::ensure;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -16,6 +19,19 @@ use rustix::{
     process::getuid,
     thread::{set_thread_res_gid, set_thread_res_uid, Gid, Uid},
 };
+
+pub const KERNEL_SU_OPTION: u32 = 0xDEAD_BEEF;
+
+const CMD_GRANT_ROOT: u64 = 0;
+// const CMD_BECOME_MANAGER: u64 = 1;
+const CMD_GET_VERSION: u64 = 2;
+// const CMD_ALLOW_SU: u64 = 3;
+// const CMD_DENY_SU: u64 = 4;
+// const CMD_GET_ALLOW_LIST: u64 = 5;
+// const CMD_GET_DENY_LIST: u64 = 6;
+const CMD_REPORT_EVENT: u64 = 7;
+pub const CMD_SET_SEPOLICY: u64 = 8;
+pub const CMD_CHECK_SAFEMODE: u64 = 9;
 
 const EVENT_POST_FS_DATA: u64 = 1;
 const EVENT_BOOT_COMPLETED: u64 = 2;
@@ -67,15 +83,13 @@ fn print_usage(program: &str, opts: Options) {
 
 fn set_identity(uid: u32, gid: u32, groups: &[u32]) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        if !groups.is_empty() {
+            libc::setgroups(groups.len(), groups.as_ptr());
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        rustix::process::set_groups(
-            groups
-                .iter()
-                .map(|g| unsafe { Gid::from_raw(*g) })
-                .collect::<Vec<_>>()
-                .as_ref(),
-        )
-        .ok();
         let gid = unsafe { Gid::from_raw(gid) };
         let uid = unsafe { Uid::from_raw(uid) };
         set_thread_res_gid(gid, gid, gid).ok();
@@ -304,32 +318,46 @@ fn add_path_to_env(path: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn get_version() -> i32 {
-    rustix::process::ksu_get_version()
+    let mut result: i32 = 0;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        #[allow(clippy::cast_possible_wrap)]
+        libc::prctl(
+            KERNEL_SU_OPTION as i32, // supposed to overflow
+            CMD_GET_VERSION,
+            std::ptr::addr_of_mut!(result).cast::<libc::c_void>(),
+        );
+    }
+    result
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn get_version() -> i32 {
-    0
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn report_event(event: u64) {
-    rustix::process::ksu_report_event(event)
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        #[allow(clippy::cast_possible_wrap)]
+        libc::prctl(
+            KERNEL_SU_OPTION as i32, // supposed to overflow
+            CMD_REPORT_EVENT,
+            event,
+        );
+    }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn report_event(_event: u64) {}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn check_kernel_safemode() -> bool {
-    rustix::process::ksu_check_kernel_safemode()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn check_kernel_safemode() -> bool {
-    false
+    let mut result: i32 = 0;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        #[allow(clippy::cast_possible_wrap)]
+        libc::prctl(
+            KERNEL_SU_OPTION as i32, // supposed to overflow
+            CMD_CHECK_SAFEMODE,
+            0,
+            0,
+            std::ptr::addr_of_mut!(result).cast::<libc::c_void>(),
+        );
+    }
+    result == KERNEL_SU_OPTION as i32
 }
 
 pub fn report_post_fs_data() {
